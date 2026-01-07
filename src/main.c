@@ -23,8 +23,10 @@ void spawn_shell() {
 
   child_pid = fork();
   if (child_pid == 0) {
-    // child porcess (shell)
+    setsid(); // create new session
+    // child process (shell)
     int slave_fd = open(slave_name, O_RDWR);
+    ioctl(slave_fd, TIOCSCTTY, 0); // set controlling terminal
     dup2(slave_fd, STDIN_FILENO);
     dup2(slave_fd, STDOUT_FILENO);
     dup2(slave_fd, STDERR_FILENO);
@@ -32,7 +34,7 @@ void spawn_shell() {
     close(slave_fd);
 
     setenv("TERM", "xterm-256color", 1);
-    execlp("/bin/fish", "/bin/bash", NULL);
+    execlp("/bin/bash", "/bin/bash", NULL);
     exit(1);
   }
 }
