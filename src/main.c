@@ -296,10 +296,12 @@ int main() {
   char buffer[4096];
 
   while (running) {
+
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
       if (ev.type == SDL_QUIT)
         running = 0;
+
       if (ev.type == SDL_WINDOWEVENT) {
         if (ev.window.event == SDL_WINDOWEVENT_RESIZED) {
           int w = ev.window.data1;
@@ -308,24 +310,98 @@ int main() {
           int cols = w / cdata[0].xadvance;
           vterm_set_size(vterm, rows, cols);
           vterm_screen_flush_damage(vterm_screen);
-
           struct winsize ws = {rows, cols, 0, 0};
           ioctl(master_fd, TIOCSWINSZ, &ws);
         }
       }
+
+      // 1. Handle Regular Text (Typed characters)
+      // We skip this if CTRL is held, because CTRL+C is not "text", it's a
+      // command.
       if (ev.type == SDL_TEXTINPUT) {
-        // filter out newlines from text input to avoid double-send with KEYDOWN
-        if (ev.text.text[0] != '\r' && ev.text.text[0] != '\n') {
+        SDL_Keymod mod = SDL_GetModState();
+        if (!(mod & KMOD_CTRL)) {
           write(master_fd, ev.text.text, strlen(ev.text.text));
         }
       }
+
+      // 2. Handle Special Keys & Ctrl Shortcuts
       if (ev.type == SDL_KEYDOWN) {
-        if (ev.key.keysym.sym == SDLK_RETURN)
-          write(master_fd, "\n", 1);
-        else if (ev.key.keysym.sym == SDLK_BACKSPACE)
-          write(master_fd, "\x7f", 1);
-        else if (ev.key.keysym.sym == SDLK_c && (SDL_GetModState() & KMOD_CTRL))
-          write(master_fd, "\x03", 1);
+        SDL_Keymod mod = SDL_GetModState();
+        SDL_Keycode key = ev.key.keysym.sym;
+        int ctrl_down = (mod & KMOD_CTRL);
+        const char *seq = NULL;
+
+        // --- Handle CTRL + Key ---
+        if (ctrl_down) {
+          // Ctrl + A-Z maps to bytes 1-26
+          if (key >= SDLK_a && key <= SDLK_z) {
+            char ch = key - SDLK_a + 1;
+            write(master_fd, &ch, 1);
+          }
+          // Ctrl + [ is Escape (ASCII 27)
+          else if (key == SDLK_LEFTBRACKET) {
+            char ch = 27;
+            write(master_fd, &ch, 1);
+          }
+          // Ctrl + \ is Quit (ASCII 28)
+          else if (key == SDLK_BACKSLASH) {
+            char ch = 28;
+            write(master_fd, &ch, 1);
+          }
+        }
+        // --- Handle Navigation & Special Keys ---
+        else {
+          switch (key) {
+          case SDLK_RETURN:
+            seq = "\r";
+            break; // Enter
+          case SDLK_BACKSPACE:
+            seq = "\x7f";
+            break; // Backspace (Del)
+          case SDLK_TAB:
+            seq = "\t";
+            break; // Tab
+          case SDLK_ESCAPE:
+            seq = "\x1b";
+            break; // Escape
+
+          // Arrow Keys (ANSI sequences)
+          case SDLK_UP:
+            seq = "\x1b[A";
+            break;
+          case SDLK_DOWN:
+            seq = "\x1b[B";
+            break;
+          case SDLK_RIGHT:
+            seq = "\x1b[C";
+            break;
+          case SDLK_LEFT:
+            seq = "\x1b[D";
+            break;
+
+          // Navigation
+          case SDLK_HOME:
+            seq = "\x1b[H";
+            break;
+          case SDLK_END:
+            seq = "\x1b[F";
+            break;
+          case SDLK_PAGEUP:
+            seq = "\x1b[5~";
+            break;
+          case SDLK_PAGEDOWN:
+            seq = "\x1b[6~";
+            break;
+          case SDLK_DELETE:
+            seq = "\x1b[3~";
+            break; // Forward Delete
+          }
+
+          if (seq) {
+            write(master_fd, seq, strlen(seq));
+          }
+        }
       }
     }
     // Read PTY
