@@ -1,12 +1,15 @@
 #define _XOPEN_SOURCE 600
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_pixels.h>
 #include <SDL2/SDL_video.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vterm.h>
 
@@ -30,7 +33,7 @@ SDL_Texture *font_texture;
 int dirty = 1;
 
 // Font data
-stbtt_bakedchar cdata[224]; // ASCII 32..255
+stbtt_bakedchar cdata[224]; // ASCII 32..255 (No full Unicode support)
 
 // pty setup
 void spawn_shell() {
@@ -106,44 +109,76 @@ void spawn_shell() {
 }
 
 void load_font() {
+  // 1. Load File
   FILE *f = fopen(FONT_PATH, "rb");
   if (!f) {
-    printf("error: could not open font file at %s\n", FONT_PATH);
+    char cwd[1024];
+    if (getcwd(cwd, sizeof(cwd)))
+      printf("Error loading font %s from cwd: %s\n", FONT_PATH, cwd);
+    else
+      printf("Error loading font %s\n", FONT_PATH);
     exit(1);
   }
+
   fseek(f, 0, SEEK_END);
   long size = ftell(f);
   fseek(f, 0, SEEK_SET);
+
   unsigned char *ttf_buffer = malloc(size);
   fread(ttf_buffer, 1, size, f);
   fclose(f);
 
-  // create bitmap for ATLAS
+  // 2. Bake Bitmap (Alpha Mask)
   unsigned char *temp_bitmap = malloc(ATLAS_WIDTH * ATLAS_HEIGHT);
-
-  // bake ascii characters 32..255 into bitmap
-  int res = stbtt_BakeFontBitmap(ttf_buffer, 0, FONT_SIZE, temp_bitmap,
+  int ret = stbtt_BakeFontBitmap(ttf_buffer, 0, FONT_SIZE, temp_bitmap,
                                  ATLAS_WIDTH, ATLAS_HEIGHT, 32, 224, cdata);
-  if (res <= 0) {
-    printf("Warning: Font baking failed or not all chars fit. res=%d\n", res);
-  }
+  // Free the raw TTF buffer immediately to save RAM
   free(ttf_buffer);
 
-  // convert 1-channel bitmap to 4-channel SDL texture
-  Uint32 *pixels = malloc(ATLAS_WIDTH * ATLAS_HEIGHT * sizeof(Uint32));
-  for (int i = 0; i < ATLAS_WIDTH * ATLAS_HEIGHT; i++) {
-    Uint8 alpha = temp_bitmap[i];
-    // pixels[i] = (val << 24) | (val << 16) | (val << 8) | val;
-    pixels[i] = (Uint32)(alpha << 24 | 0x00FFFFFF);
+  if (ret <= 0) {
+    printf("Error: Font bitmap too small for all characters (Code: %d)\n", ret);
+    exit(1);
+    // We continue anyway, but some chars might be missing
   }
+
+  // 3. Create Surface & Texture using SDL_MapRGBA (Safe for Software Render)
+  // We create a temporary surface first to handle pixel formatting
+  // automatically
+  SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(
+      0, ATLAS_WIDTH, ATLAS_HEIGHT, 32, SDL_PIXELFORMAT_ABGR8888);
+  SDL_LockSurface(surface);
+  Uint32 *pixels = (Uint32 *)surface->pixels;
+  int width = surface->w;
+  int height = surface->h;
+
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      Uint8 alpha = temp_bitmap[y * ATLAS_WIDTH + x];
+      int index = (y * (surface->pitch / 4)) + x;
+      if (alpha > 0) {
+        pixels[index] = SDL_MapRGBA(surface->format, 255, 255, 255, alpha);
+      } else {
+        pixels[index] = SDL_MapRGBA(surface->format, 0, 0, 0, 0);
+      }
+    }
+  }
+  // for (int i = 0; i < ATLAS_WIDTH * ATLAS_HEIGHT; i++) {
+  //   Uint8 alpha = temp_bitmap[i];
+  //   // Map: White color (255,255,255) with variable Alpha
+  //   // This handles Big Endian vs Little Endian automatically
+  //   pixels[i] = SDL_MapRGBA(surface->format, 255, 255, 255, alpha);
+  // }
+
+  SDL_UnlockSurface(surface);
   free(temp_bitmap);
 
-  font_texture =
-      SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
-                        SDL_TEXTUREACCESS_STATIC, ATLAS_WIDTH, ATLAS_HEIGHT);
-  SDL_UpdateTexture(font_texture, NULL, pixels, ATLAS_WIDTH * 4);
+  // Convert Surface to Texture
+  font_texture = SDL_CreateTextureFromSurface(renderer, surface);
+  SDL_FreeSurface(surface); // Clean up the CPU surface
+
+  // Important: Set blend mode so transparent pixels actually work
   SDL_SetTextureBlendMode(font_texture, SDL_BLENDMODE_BLEND);
-  free(pixels);
+
   if (cdata[0].xadvance == 0)
     cdata[0].xadvance = FONT_SIZE / 2;
 }
@@ -187,8 +222,8 @@ void render_term() {
       }
 
       // --- FOREGROUND (TEXT) ---
-      if (code < 32 || code > 126)
-        continue; // Skip non-printable for now
+      if (code <= 32 || code > 255)
+        continue;
 
       vterm_state_convert_color_to_rgb(state, &cell.fg);
       SDL_SetTextureColorMod(font_texture, cell.fg.rgb.red, cell.fg.rgb.green,
@@ -414,12 +449,14 @@ int main() {
     if (select(master_fd + 1, &readfds, NULL, NULL, &timeout) > 0) {
       int len = read(master_fd, buffer, sizeof(buffer));
       if (len > 0) {
-        printf("DEBUG: Read %d bytes from PTY: '%.*s'\n", len, len, buffer);
-        fflush(stdout);
+        // printf("DEBUG: Read %d bytes from PTY: '%.*s'\n", len, len, buffer);
+        // fflush(stdout);
         vterm_input_write(vterm, buffer, len);
         vterm_screen_flush_damage(vterm_screen);
       } else if (len == -1) {
-        perror("read pty");
+        if (errno != EIO) {
+          perror("read pty");
+        }
         running = 0;
       } else {
         running = 0; // EOF
@@ -446,5 +483,9 @@ int main() {
   SDL_DestroyWindow(window);
   SDL_Quit();
   vterm_free(vterm);
+
+  // Reap child process
+  waitpid(child_pid, NULL, 0);
+
   return 0;
 }
