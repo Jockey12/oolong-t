@@ -20,7 +20,7 @@
 
 // --- Config ---
 #define FONT_PATH "src/font.ttf"
-#define FONT_SIZE 22.0f
+#define FONT_SIZE 25.0f
 // Increased to 2048 to fit thousands of icons
 #define ATLAS_WIDTH 2048
 #define ATLAS_HEIGHT 2048
