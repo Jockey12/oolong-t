@@ -1,13 +1,15 @@
-#define _XOPEN_SOURCE 600
+#define _GNU_SOURCE
 #include <SDL2/SDL.h>
-#include <SDL2/SDL_pixels.h>
 #include <SDL2/SDL_video.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -16,13 +18,14 @@
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
 
-// font config
+// --- Config ---
 #define FONT_PATH "src/font.ttf"
-#define FONT_SIZE 20.0f
-#define ATLAS_WIDTH 512
-#define ATLAS_HEIGHT 512
+#define FONT_SIZE 22.0f
+// Increased to 2048 to fit thousands of icons
+#define ATLAS_WIDTH 2048
+#define ATLAS_HEIGHT 2048
 
-// Globals
+// --- Globals ---
 int master_fd;
 pid_t child_pid;
 VTerm *vterm;
@@ -32,163 +35,128 @@ SDL_Renderer *renderer;
 SDL_Texture *font_texture;
 int dirty = 1;
 
-// Font data
-stbtt_bakedchar cdata[224]; // ASCII 32..255 (No full Unicode support)
+int cell_width = 0;
+int cell_height = 0;
 
-// pty setup
+// --- Font Data Ranges ---
+stbtt_packedchar ascii_chars[96];      // 32..126 (Standard Text)
+stbtt_packedchar box_chars[128];       // U+2500..U+257F (Borders)
+stbtt_packedchar powerline_chars[128]; // U+E0A0..U+E0FF (Powerline triangles)
+stbtt_packedchar
+    icon_chars[4096]; // U+E5FA..U+F500 (DevIcons, FontAwesome, etc)
+
+// --- PTY Setup (Standard) ---
 void spawn_shell() {
   master_fd = posix_openpt(O_RDWR | O_NOCTTY);
   if (master_fd == -1) {
     perror("posix_openpt");
     exit(1);
   }
-
   if (grantpt(master_fd) == -1) {
     perror("grantpt");
     exit(1);
   }
-
   if (unlockpt(master_fd) == -1) {
     perror("unlockpt");
     exit(1);
   }
 
   char *slave_name = ptsname(master_fd);
-  if (slave_name == NULL) {
-    perror("ttyname");
+  if (!slave_name) {
+    perror("ptsname");
     exit(1);
   }
 
   child_pid = fork();
-  if (child_pid == -1) {
-    perror("fork");
-    exit(1);
-  }
-
   if (child_pid == 0) {
-    // --- CHILD PROCESS ---
     setsid();
-
     int slave_fd = open(slave_name, O_RDWR);
-    if (slave_fd == -1) {
-      perror("open slave");
-      exit(1);
-    }
-
-// Set Controlling Terminal
-#ifdef TIOCSCTTY
     ioctl(slave_fd, TIOCSCTTY, 0);
-#endif
-
-    dup2(slave_fd, STDIN_FILENO);
-    dup2(slave_fd, STDOUT_FILENO);
-    dup2(slave_fd, STDERR_FILENO);
-
-    // Close the master in the child (important!)
+    dup2(slave_fd, 0);
+    dup2(slave_fd, 1);
+    dup2(slave_fd, 2);
     close(master_fd);
     close(slave_fd);
 
-    // --- SETUP ENVIRONMENT ---
-    // Ensure we are xterm-256color
     setenv("TERM", "xterm-256color", 1);
-    // Clear old size variables to force bash to ask the PTY
     unsetenv("COLUMNS");
     unsetenv("LINES");
-
-    // --- EXECUTE SHELL ---
-    // FIX 2: use -l to make it a login shell (loads config)
-    execlp("/bin/bash", "bash", "-l", NULL);
-
-    // Fallback if bash is missing
-    execlp("/bin/sh", "sh", NULL);
-
-    perror("execlp failed");
+    execlp("bash", "bash", NULL);
     exit(1);
   }
-  // Parent doesn't need to do anything else
 }
 
+// --- Font Loading ---
 void load_font() {
-  // 1. Load File
-  FILE *f = fopen(FONT_PATH, "rb");
-  if (!f) {
-    char cwd[1024];
-    if (getcwd(cwd, sizeof(cwd)))
-      printf("Error loading font %s from cwd: %s\n", FONT_PATH, cwd);
-    else
-      printf("Error loading font %s\n", FONT_PATH);
+  int fd = open(FONT_PATH, O_RDONLY);
+  if (fd == -1) {
+    printf("Error opening font: %s\n", FONT_PATH);
+    exit(1);
+  }
+  struct stat sb;
+  fstat(fd, &sb);
+  unsigned char *ttf_buffer =
+      mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  close(fd);
+
+  unsigned char *temp_bitmap = calloc(1, ATLAS_WIDTH * ATLAS_HEIGHT);
+
+  stbtt_pack_context spc;
+  if (!stbtt_PackBegin(&spc, temp_bitmap, ATLAS_WIDTH, ATLAS_HEIGHT, 0, 1,
+                       NULL)) {
+    printf("Failed to init font packer\n");
     exit(1);
   }
 
-  fseek(f, 0, SEEK_END);
-  long size = ftell(f);
-  fseek(f, 0, SEEK_SET);
+  // 1. Pack ASCII
+  stbtt_PackFontRange(&spc, ttf_buffer, 0, FONT_SIZE, 32, 96, ascii_chars);
 
-  unsigned char *ttf_buffer = malloc(size);
-  fread(ttf_buffer, 1, size, f);
-  fclose(f);
+  // 2. Pack Box Drawing (Tmux borders)
+  stbtt_PackFontRange(&spc, ttf_buffer, 0, FONT_SIZE, 0x2500, 128, box_chars);
 
-  // 2. Bake Bitmap (Alpha Mask)
-  unsigned char *temp_bitmap = malloc(ATLAS_WIDTH * ATLAS_HEIGHT);
-  int ret = stbtt_BakeFontBitmap(ttf_buffer, 0, FONT_SIZE, temp_bitmap,
-                                 ATLAS_WIDTH, ATLAS_HEIGHT, 32, 224, cdata);
-  // Free the raw TTF buffer immediately to save RAM
-  free(ttf_buffer);
+  // 3. Pack Powerline Symbols (The triangles in shell prompts)
+  stbtt_PackFontRange(&spc, ttf_buffer, 0, FONT_SIZE, 0xE0A0, 96,
+                      powerline_chars);
 
-  if (ret <= 0) {
-    printf("Error: Font bitmap too small for all characters (Code: %d)\n", ret);
-    exit(1);
-    // We continue anyway, but some chars might be missing
-  }
+  // 4. Pack Common Nerd Font Icons (Folder icons, git logos, etc)
+  // This range (E5FA to F500) covers Seti-UI, Devicons, and FontAwesome
+  stbtt_PackFontRange(&spc, ttf_buffer, 0, FONT_SIZE, 0xE5FA, 3800, icon_chars);
 
-  // 3. Create Surface & Texture using SDL_MapRGBA (Safe for Software Render)
-  // We create a temporary surface first to handle pixel formatting
-  // automatically
+  stbtt_PackEnd(&spc);
+  munmap(ttf_buffer, sb.st_size);
+
   SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(
-      0, ATLAS_WIDTH, ATLAS_HEIGHT, 32, SDL_PIXELFORMAT_ABGR8888);
+      0, ATLAS_WIDTH, ATLAS_HEIGHT, 32, SDL_PIXELFORMAT_ARGB8888);
   SDL_LockSurface(surface);
   Uint32 *pixels = (Uint32 *)surface->pixels;
-  int width = surface->w;
-  int height = surface->h;
 
-  for (int y = 0; y < height; y++) {
-    for (int x = 0; x < width; x++) {
-      Uint8 alpha = temp_bitmap[y * ATLAS_WIDTH + x];
-      int index = (y * (surface->pitch / 4)) + x;
-      if (alpha > 0) {
-        pixels[index] = SDL_MapRGBA(surface->format, 255, 255, 255, alpha);
-      } else {
-        pixels[index] = SDL_MapRGBA(surface->format, 0, 0, 0, 0);
-      }
-    }
+  for (int i = 0; i < ATLAS_WIDTH * ATLAS_HEIGHT; i++) {
+    Uint8 alpha = temp_bitmap[i];
+    pixels[i] = (alpha > 0) ? SDL_MapRGBA(surface->format, 255, 255, 255, alpha)
+                            : SDL_MapRGBA(surface->format, 0, 0, 0, 0);
   }
-  // for (int i = 0; i < ATLAS_WIDTH * ATLAS_HEIGHT; i++) {
-  //   Uint8 alpha = temp_bitmap[i];
-  //   // Map: White color (255,255,255) with variable Alpha
-  //   // This handles Big Endian vs Little Endian automatically
-  //   pixels[i] = SDL_MapRGBA(surface->format, 255, 255, 255, alpha);
-  // }
 
   SDL_UnlockSurface(surface);
   free(temp_bitmap);
 
-  // Convert Surface to Texture
   font_texture = SDL_CreateTextureFromSurface(renderer, surface);
-  SDL_FreeSurface(surface); // Clean up the CPU surface
-
-  // Important: Set blend mode so transparent pixels actually work
+  SDL_FreeSurface(surface);
   SDL_SetTextureBlendMode(font_texture, SDL_BLENDMODE_BLEND);
 
-  if (cdata[0].xadvance == 0)
-    cdata[0].xadvance = FONT_SIZE / 2;
+  // Metrics
+  if (ascii_chars[0].xadvance == 0)
+    ascii_chars[0].xadvance = FONT_SIZE / 2;
+  cell_width = (int)ceilf(ascii_chars[0].xadvance);
+  cell_height = (int)FONT_SIZE;
+
+  printf("Font loaded. Cell size: %dx%d\n", cell_width, cell_height);
 }
 
+// --- Rendering ---
 void render_term() {
-  // 1. Clear with the DEFAULT background color (usually black)
   VTermState *state = vterm_obtain_state(vterm);
   VTermColor default_fg, default_bg;
   vterm_state_get_default_colors(state, &default_fg, &default_bg);
-
   SDL_SetRenderDrawColor(renderer, default_bg.rgb.red, default_bg.rgb.green,
                          default_bg.rgb.blue, 255);
   SDL_RenderClear(renderer);
@@ -196,7 +164,6 @@ void render_term() {
   int rows, cols;
   vterm_get_size(vterm, &rows, &cols);
 
-  // 2. Iterate Cells
   for (int row = 0; row < rows; row++) {
     for (int col = 0; col < cols; col++) {
       VTermScreenCell cell;
@@ -205,36 +172,43 @@ void render_term() {
 
       uint32_t code = cell.chars[0];
 
-      // --- BACKGROUND ---
-      // Convert VTerm color to RGB
+      // Draw Background
       vterm_state_convert_color_to_rgb(state, &cell.bg);
-
-      // Only draw background if it is NOT the default color
       if (cell.bg.rgb.red != default_bg.rgb.red ||
           cell.bg.rgb.green != default_bg.rgb.green ||
           cell.bg.rgb.blue != default_bg.rgb.blue) {
-
         SDL_SetRenderDrawColor(renderer, cell.bg.rgb.red, cell.bg.rgb.green,
                                cell.bg.rgb.blue, 255);
-        SDL_Rect bg_rect = {col * cdata[0].xadvance, row * FONT_SIZE,
-                            cdata[0].xadvance, FONT_SIZE};
+        SDL_Rect bg_rect = {col * cell_width, row * cell_height, cell_width,
+                            cell_height};
         SDL_RenderFillRect(renderer, &bg_rect);
       }
 
-      // --- FOREGROUND (TEXT) ---
-      if (code <= 32 || code > 255)
-        continue;
+      // Resolve Glyph
+      stbtt_packedchar *b = NULL;
 
+      if (code >= 32 && code < 128) {
+        b = &ascii_chars[code - 32];
+      } else if (code >= 0x2500 && code < 0x2580) {
+        b = &box_chars[code - 0x2500];
+      } else if (code >= 0xE0A0 && code < 0xE100) {
+        b = &powerline_chars[code - 0xE0A0];
+      } else if (code >= 0xE5FA && code < 0xF500) {
+        b = &icon_chars[code - 0xE5FA];
+      } else {
+        continue;
+      }
+
+      // Draw Glyph
       vterm_state_convert_color_to_rgb(state, &cell.fg);
       SDL_SetTextureColorMod(font_texture, cell.fg.rgb.red, cell.fg.rgb.green,
                              cell.fg.rgb.blue);
 
       stbtt_aligned_quad q;
-      float x = col * cdata[0].xadvance;
-      float y = (row * FONT_SIZE) + (FONT_SIZE * 0.75f); // Baseline adjustment
+      float x = col * cell_width;
+      float y = (row * cell_height) + (cell_height * 0.75f);
 
-      stbtt_GetBakedQuad(cdata, ATLAS_WIDTH, ATLAS_HEIGHT, code - 32, &x, &y,
-                         &q, 1);
+      stbtt_GetPackedQuad(b, ATLAS_WIDTH, ATLAS_HEIGHT, 0, &x, &y, &q, 1);
 
       SDL_Rect src = {(int)(q.s0 * ATLAS_WIDTH), (int)(q.t0 * ATLAS_HEIGHT),
                       (int)((q.s1 - q.s0) * ATLAS_WIDTH),
@@ -245,19 +219,15 @@ void render_term() {
     }
   }
 
-  // 3. Draw Cursor (Invert colors of the cell under it)
+  // Cursor
   VTermPos cursor_pos;
   vterm_state_get_cursorpos(state, &cursor_pos);
-
-  // Blink logic: only draw if blink state is "ON"
   if ((SDL_GetTicks() / 500) % 2) {
-    SDL_Rect cursor_rect = {cursor_pos.col * cdata[0].xadvance,
-                            cursor_pos.row * FONT_SIZE, cdata[0].xadvance,
-                            FONT_SIZE};
-
-    // Draw a semi-transparent white box
+    SDL_Rect cursor_rect = {cursor_pos.col * cell_width,
+                            cursor_pos.row * cell_height, cell_width,
+                            cell_height};
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 128); // 50% opacity cursor
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 128);
     SDL_RenderFillRect(renderer, &cursor_rect);
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
   }
@@ -266,64 +236,44 @@ void render_term() {
   dirty = 0;
 }
 
-// vterm callbacks
-static int screen_damage(VTermRect rect, void *user) {
+// --- Main ---
+static int damage(VTermRect r, void *u) {
   dirty = 1;
   return 1;
 }
-
-static void output_callback(const char *s, size_t len, void *user) {
-  write(master_fd, s, len);
-}
-
-static VTermScreenCallbacks screen_callbacks = {
-    .damage = screen_damage,
-};
+static void out_cb(const char *s, size_t l, void *u) { write(master_fd, s, l); }
+static VTermScreenCallbacks cbs = {.damage = damage};
 
 int main() {
   spawn_shell();
 
-  // init libvterm
   vterm = vterm_new(24, 80);
-  vterm_output_set_callback(vterm, output_callback, NULL);
+  vterm_output_set_callback(vterm, out_cb, NULL);
   vterm_screen = vterm_obtain_screen(vterm);
-  vterm_screen_set_callbacks(vterm_screen, &screen_callbacks, NULL);
+  vterm_screen_set_callbacks(vterm_screen, &cbs, NULL);
   vterm_screen_reset(vterm_screen, 1);
-
-  // Set default colors (White text on black background)
-  VTermState *state = vterm_obtain_state(vterm);
-  VTermColor default_fg = {0};
-  default_fg.type = VTERM_COLOR_RGB;
-  default_fg.rgb.red = 255;
-  default_fg.rgb.green = 255;
-  default_fg.rgb.blue = 255;
-
-  VTermColor default_bg = {0};
-  default_bg.type = VTERM_COLOR_RGB;
-  default_bg.rgb.red = 0;
-  default_bg.rgb.green = 0;
-  default_bg.rgb.blue = 0;
-  vterm_state_set_default_colors(state, &default_fg, &default_bg);
   vterm_set_utf8(vterm, 1);
 
-  // Init SDL
+  VTermState *state = vterm_obtain_state(vterm);
+  VTermColor fg = {.type = VTERM_COLOR_RGB, .rgb = {255, 255, 255}};
+  VTermColor bg = {.type = VTERM_COLOR_RGB, .rgb = {0, 0, 0}};
+  vterm_state_set_default_colors(state, &fg, &bg);
+
   SDL_Init(SDL_INIT_VIDEO);
-  window = SDL_CreateWindow("Term", 100, 100, 800, 400,
-                            SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+  window =
+      SDL_CreateWindow("Term", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                       800, 600, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
   renderer = SDL_CreateRenderer(
       window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 
   load_font();
 
-  // Initial resize to match window
+  // Initial Sizing
   int w, h;
   SDL_GetWindowSize(window, &w, &h);
-  int rows = h / FONT_SIZE;
-  int cols = w / cdata[0].xadvance;
+  int rows = h / cell_height;
+  int cols = w / cell_width;
   vterm_set_size(vterm, rows, cols);
-  vterm_screen_flush_damage(vterm_screen);
-
-  // Update PTY size
   struct winsize ws = {rows, cols, 0, 0};
   ioctl(master_fd, TIOCSWINSZ, &ws);
 
@@ -331,161 +281,97 @@ int main() {
   char buffer[4096];
 
   while (running) {
-
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
       if (ev.type == SDL_QUIT)
         running = 0;
 
-      if (ev.type == SDL_WINDOWEVENT) {
-        if (ev.window.event == SDL_WINDOWEVENT_RESIZED) {
-          int w = ev.window.data1;
-          int h = ev.window.data2;
-          int rows = h / FONT_SIZE;
-          int cols = w / cdata[0].xadvance;
-          vterm_set_size(vterm, rows, cols);
-          vterm_screen_flush_damage(vterm_screen);
-          struct winsize ws = {rows, cols, 0, 0};
-          ioctl(master_fd, TIOCSWINSZ, &ws);
-        }
+      if (ev.type == SDL_WINDOWEVENT &&
+          ev.window.event == SDL_WINDOWEVENT_RESIZED) {
+        int w = ev.window.data1;
+        int h = ev.window.data2;
+        int rows = h / cell_height;
+        int cols = w / cell_width;
+        vterm_set_size(vterm, rows, cols);
+        vterm_screen_flush_damage(vterm_screen);
+        struct winsize ws = {rows, cols, 0, 0};
+        ioctl(master_fd, TIOCSWINSZ, &ws);
+        dirty = 1;
       }
-
-      // 1. Handle Regular Text (Typed characters)
-      // We skip this if CTRL is held, because CTRL+C is not "text", it's a
-      // command.
-      if (ev.type == SDL_TEXTINPUT) {
-        SDL_Keymod mod = SDL_GetModState();
-        if (!(mod & KMOD_CTRL)) {
-          write(master_fd, ev.text.text, strlen(ev.text.text));
-        }
+      if (ev.type == SDL_TEXTINPUT && !(SDL_GetModState() & KMOD_CTRL)) {
+        write(master_fd, ev.text.text, strlen(ev.text.text));
       }
-
-      // 2. Handle Special Keys & Ctrl Shortcuts
       if (ev.type == SDL_KEYDOWN) {
-        SDL_Keymod mod = SDL_GetModState();
         SDL_Keycode key = ev.key.keysym.sym;
-        int ctrl_down = (mod & KMOD_CTRL);
-        const char *seq = NULL;
-
-        // --- Handle CTRL + Key ---
-        if (ctrl_down) {
-          // Ctrl + A-Z maps to bytes 1-26
+        if (SDL_GetModState() & KMOD_CTRL) {
           if (key >= SDLK_a && key <= SDLK_z) {
-            char ch = key - SDLK_a + 1;
-            write(master_fd, &ch, 1);
+            char c = key - SDLK_a + 1;
+            write(master_fd, &c, 1);
+          } else if (key == SDLK_c) {
+            char c = 3;
+            write(master_fd, &c, 1);
+          } else if (key == SDLK_LEFTBRACKET) {
+            char c = 27;
+            write(master_fd, &c, 1);
           }
-          // Ctrl + [ is Escape (ASCII 27)
-          else if (key == SDLK_LEFTBRACKET) {
-            char ch = 27;
-            write(master_fd, &ch, 1);
-          }
-          // Ctrl + \ is Quit (ASCII 28)
-          else if (key == SDLK_BACKSLASH) {
-            char ch = 28;
-            write(master_fd, &ch, 1);
-          }
-        }
-        // --- Handle Navigation & Special Keys ---
-        else {
-          switch (key) {
-          case SDLK_RETURN:
+        } else {
+          const char *seq = NULL;
+          if (key == SDLK_RETURN)
             seq = "\r";
-            break; // Enter
-          case SDLK_BACKSPACE:
+          else if (key == SDLK_BACKSPACE)
             seq = "\x7f";
-            break; // Backspace (Del)
-          case SDLK_TAB:
-            seq = "\t";
-            break; // Tab
-          case SDLK_ESCAPE:
+          else if (key == SDLK_ESCAPE)
             seq = "\x1b";
-            break; // Escape
-
-          // Arrow Keys (ANSI sequences)
-          case SDLK_UP:
+          else if (key == SDLK_TAB)
+            seq = "\t";
+          else if (key == SDLK_UP)
             seq = "\x1b[A";
-            break;
-          case SDLK_DOWN:
+          else if (key == SDLK_DOWN)
             seq = "\x1b[B";
-            break;
-          case SDLK_RIGHT:
+          else if (key == SDLK_RIGHT)
             seq = "\x1b[C";
-            break;
-          case SDLK_LEFT:
+          else if (key == SDLK_LEFT)
             seq = "\x1b[D";
-            break;
-
-          // Navigation
-          case SDLK_HOME:
-            seq = "\x1b[H";
-            break;
-          case SDLK_END:
-            seq = "\x1b[F";
-            break;
-          case SDLK_PAGEUP:
+          else if (key == SDLK_PAGEUP)
             seq = "\x1b[5~";
-            break;
-          case SDLK_PAGEDOWN:
+          else if (key == SDLK_PAGEDOWN)
             seq = "\x1b[6~";
-            break;
-          case SDLK_DELETE:
-            seq = "\x1b[3~";
-            break; // Forward Delete
-          }
+          else if (key == SDLK_HOME)
+            seq = "\x1b[H";
+          else if (key == SDLK_END)
+            seq = "\x1b[F";
 
-          if (seq) {
+          if (seq)
             write(master_fd, seq, strlen(seq));
-          }
         }
       }
     }
-    // Read PTY
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(master_fd, &readfds);
-    // struct timeval timeout = {0, 10000}; // 10ms poll
-    struct timeval timeout = {0, dirty ? 0 : 10000}; // 0ms or 100ms
 
-    if (select(master_fd + 1, &readfds, NULL, NULL, &timeout) > 0) {
+    fd_set rfd;
+    FD_ZERO(&rfd);
+    FD_SET(master_fd, &rfd);
+    struct timeval tv = {0, dirty ? 0 : 10000};
+
+    if (select(master_fd + 1, &rfd, NULL, NULL, &tv) > 0) {
       int len = read(master_fd, buffer, sizeof(buffer));
       if (len > 0) {
-        // printf("DEBUG: Read %d bytes from PTY: '%.*s'\n", len, len, buffer);
-        // fflush(stdout);
         vterm_input_write(vterm, buffer, len);
         vterm_screen_flush_damage(vterm_screen);
-      } else if (len == -1) {
-        if (errno != EIO) {
-          perror("read pty");
-        }
+        dirty = 1;
+      } else if (len < 0 && errno != EIO)
         running = 0;
-      } else {
-        running = 0; // EOF
-      }
-      dirty = 1;
     }
 
-    // render only if dirty
-    static int last_blink = 0;
-    int now = SDL_GetTicks();
-    if (now / 500 != last_blink) {
-      dirty = 1;
-      last_blink = now / 500;
-    }
-
-    if (dirty) {
+    if (dirty)
       render_term();
+    static int last_blink = 0;
+    if (SDL_GetTicks() / 500 != last_blink) {
+      dirty = 1;
+      last_blink = SDL_GetTicks() / 500;
     }
   }
 
-  SDL_DestroyTexture(font_texture);
-
-  SDL_DestroyRenderer(renderer);
-  SDL_DestroyWindow(window);
   SDL_Quit();
   vterm_free(vterm);
-
-  // Reap child process
-  waitpid(child_pid, NULL, 0);
-
   return 0;
 }

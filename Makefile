@@ -1,6 +1,7 @@
 CC = gcc
-CFLAGS = -Wall -O2 $(shell sdl2-config --cflags)
+CFLAGS = -Wall -O2 
 LIBS = $(shell sdl2-config --libs) -lvterm -lm
+# $(shell sdl2-config --cflags) if not using #define _GNU_SOURCE
 
 .PHONY: all clean
 
