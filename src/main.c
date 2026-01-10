@@ -1,27 +1,11 @@
 #define _GNU_SOURCE
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_video.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/select.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <vterm.h>
-
+#include "libs.h"
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
 
 // --- Config ---
 #define FONT_PATH "src/font.ttf"
 #define FONT_SIZE 25.0f
-// Increased to 2048 to fit thousands of icons
 #define ATLAS_WIDTH 2048
 #define ATLAS_HEIGHT 2048
 
