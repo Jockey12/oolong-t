@@ -1,5 +1,5 @@
 # oolong-t
-
+vibe coded, not actual project
 A lightweight, GPU-accelerated terminal emulator written in C using SDL2 and libvterm.
 
 ## Features
